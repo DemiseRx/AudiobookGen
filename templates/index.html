@@ -1,0 +1,101 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="panel">
+  <h2>Automatic mode (one-click synthesis)</h2>
+  {% if error %}
+  <div class="alert">{{ error }}</div>
+  {% endif %}
+  <form action="/synthesize" method="post" enctype="multipart/form-data" class="form-grid">
+    <input type="hidden" name="mode" value="automatic" />
+    <label class="form-field">
+      <span>Text</span>
+      <textarea name="text" rows="8" placeholder="Paste text to narrate"></textarea>
+    </label>
+    <label class="form-field">
+      <span>or Upload document</span>
+      <input type="file" name="upload" accept=".txt,.md,.docx,.epub" />
+    </label>
+    <label class="form-field">
+      <span>Voice</span>
+      <select name="voice">
+        {% for voice in voices %}
+        <option value="{{ voice.display_name }}">{{ voice.display_name }} – {{ voice.description }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <details class="advanced">
+      <summary>Advanced parameters</summary>
+      <div class="advanced-grid">
+        <label>
+          Temperature
+          <input type="number" step="0.1" name="temperature" value="{{ defaults.temperature }}" />
+        </label>
+        <label>
+          Top-p
+          <input type="number" step="0.05" name="top_p" value="{{ defaults.top_p }}" />
+        </label>
+        <label>
+          Repetition penalty
+          <input type="number" step="0.1" name="repetition_penalty" value="{{ defaults.repetition_penalty }}" />
+        </label>
+        <label>
+          Max new tokens
+          <input type="number" step="50" name="max_new_tokens" value="{{ defaults.max_new_tokens }}" />
+        </label>
+      </div>
+    </details>
+    <button type="submit" class="primary">Synthesize</button>
+  </form>
+</section>
+
+<section class="panel">
+  <h2>Manual mode (advanced control)</h2>
+  <p>
+    Manual mode exposes the chunk-by-chunk generation workflow. Load a long
+    document, inspect the detected segments and trigger synthesis for each part
+    with optional voice overrides.
+  </p>
+  <form action="/synthesize" method="post" enctype="multipart/form-data" class="form-grid">
+    <input type="hidden" name="mode" value="manual" />
+    <label class="form-field">
+      <span>Text</span>
+      <textarea name="text" rows="6" placeholder="Paste text for manual session"></textarea>
+    </label>
+    <label class="form-field">
+      <span>or Upload document</span>
+      <input type="file" name="upload" accept=".txt,.md,.docx,.epub" />
+    </label>
+    <label class="form-field">
+      <span>Default voice</span>
+      <select name="voice">
+        {% for voice in voices %}
+        <option value="{{ voice.display_name }}">{{ voice.display_name }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <details class="advanced">
+      <summary>Advanced parameters</summary>
+      <div class="advanced-grid">
+        <label>
+          Temperature
+          <input type="number" step="0.1" name="temperature" value="{{ defaults.temperature }}" />
+        </label>
+        <label>
+          Top-p
+          <input type="number" step="0.05" name="top_p" value="{{ defaults.top_p }}" />
+        </label>
+        <label>
+          Repetition penalty
+          <input type="number" step="0.1" name="repetition_penalty" value="{{ defaults.repetition_penalty }}" />
+        </label>
+        <label>
+          Max new tokens
+          <input type="number" step="50" name="max_new_tokens" value="{{ defaults.max_new_tokens }}" />
+        </label>
+      </div>
+    </details>
+    <button type="submit" class="secondary">Start manual session</button>
+  </form>
+</section>
+{% endblock %}

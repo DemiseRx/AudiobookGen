@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="panel">
+  <h2>Manual session</h2>
+  <p>
+    Session ID: <code>{{ session.session_id }}</code> — Default voice:
+    <strong>{{ session.voice.display_name }}</strong>
+  </p>
+  <p>
+    Generate segments individually and optionally switch voices per chunk. The
+    resulting files are stored inside the <code>outputs/</code> directory.
+  </p>
+  <table class="segments">
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>Preview</th>
+        <th>Voice</th>
+        <th>Status</th>
+        <th>Action</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for chunk in session.segments %}
+      <tr>
+        <td>{{ chunk.index + 1 }}</td>
+        <td>{{ chunk.text[:160] }}{% if chunk.text|length > 160 %}…{% endif %}</td>
+        <td>
+          <form action="/manual/{{ session.session_id }}/segment/{{ chunk.index }}" method="post" class="segment-form">
+            <select name="voice">
+              <option value="">Default ({{ session.voice.display_name }})</option>
+              {% for voice in voices %}
+              <option value="{{ voice.display_name }}">{{ voice.display_name }}</option>
+              {% endfor %}
+            </select>
+            <button type="submit">Generate</button>
+          </form>
+        </td>
+        <td>
+          {% if chunk.index in session.generated_segments %}
+          <a href="/download/{{ session.generated_segments[chunk.index].name }}" class="download-link">Download</a>
+          {% else %}
+          Pending
+          {% endif %}
+        </td>
+        <td>
+          {% if chunk.index in session.generated_segments %}
+          ✅ Done
+          {% else %}
+          ⏳ Waiting
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p><a href="/">← Back to start</a></p>
+</section>
+{% endblock %}
