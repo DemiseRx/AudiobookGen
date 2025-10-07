@@ -1,75 +1,98 @@
-"""Utilities for splitting long text into model-friendly chunks."""
+"""Utility helpers for splitting long texts into manageable synthesis chunks."""
+
 from __future__ import annotations
 
+import math
+import re
 from dataclasses import dataclass
-from typing import List
-
-from transformers import PreTrainedTokenizerBase
+from typing import Iterable, List
 
 
 @dataclass
 class TextChunk:
-    """Represents a chunk of text ready for synthesis."""
+    """Represents a single synthesis unit."""
 
     index: int
     text: str
-    token_length: int
 
-    @property
-    def safe_prompt(self) -> str:
-        """Return text trimmed for logging or manual review."""
-
-        preview = " ".join(self.text.split())
-        return preview if len(preview) <= 120 else preview[:117] + "..."
+    def to_dict(self) -> dict:
+        return {"index": self.index, "text": self.text}
 
 
-def chunk_text(
+SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def normalise_whitespace(text: str) -> str:
+    """Collapse superfluous whitespace while keeping intentional paragraph gaps."""
+
+    cleaned = re.sub(r"\s+", " ", text.strip())
+    # Reintroduce double new lines for paragraph style separation where possible.
+    cleaned = cleaned.replace(" \n ", "\n\n")
+    return cleaned
+
+
+def split_text(
     text: str,
-    tokenizer: PreTrainedTokenizerBase,
-    max_tokens: int = 1000,
-    overlap_sentences: int = 0,
+    *,
+    max_words: int = 220,
+    max_characters: int = 1500,
 ) -> List[TextChunk]:
-    """Split the text into manageable pieces based on tokenizer length.
+    """Split ``text`` into natural sounding chunks.
 
-    Args:
-        text: Raw text to segment.
-        tokenizer: Tokenizer used for counting tokens.
-        max_tokens: Maximum tokens per chunk (default 1000 to stay within model limits).
-        overlap_sentences: Optional number of trailing sentences to carry over to the
-            next chunk. This reduces audible boundary artifacts for long-form speech.
+    The splitter favours paragraph and sentence boundaries while keeping the
+    resulting segments within soft word/character limits. These defaults work
+    well for KaniTTS which prefers prompts under roughly two thousand tokens.
     """
 
-    sentences = [s.strip() for s in text.replace("\n", " ").split(". ") if s.strip()]
+    if not text.strip():
+        return []
+
+    paragraphs = [para.strip() for para in text.split("\n") if para.strip()]
     chunks: List[TextChunk] = []
-    current: List[str] = []
+    current_chunk: List[str] = []
+    word_count = 0
 
-    def flush_chunk(index: int, parts: List[str]) -> None:
-        if not parts:
+    def flush() -> None:
+        nonlocal word_count, current_chunk, chunks
+        if not current_chunk:
             return
-        joined = ". ".join(parts).strip()
-        if not joined.endswith("."):
-            joined += "."
-        token_length = len(tokenizer(joined).input_ids)
-        chunks.append(TextChunk(index=index, text=joined, token_length=token_length))
+        chunk_text = " ".join(current_chunk).strip()
+        if chunk_text:
+            chunks.append(TextChunk(len(chunks), chunk_text))
+        current_chunk = []
+        word_count = 0
 
-    index = 0
-    for sentence in sentences:
-        tentative = current + [sentence]
-        joined = ". ".join(tentative).strip()
-        token_count = len(tokenizer(joined).input_ids)
-        if token_count > max_tokens and current:
-            flush_chunk(index, current)
-            index += 1
-            current = tentative[-overlap_sentences:] if overlap_sentences else []
-        current.append(sentence)
+    for para in paragraphs:
+        sentences = re.split(r"(?<=[.!?])\s+", para)
+        for sentence in sentences:
+            if not sentence:
+                continue
+            sentence_words = sentence.split()
+            prospective_words = word_count + len(sentence_words)
+            prospective_chars = sum(len(part) for part in current_chunk) + len(sentence)
+            if (
+                prospective_words > max_words
+                or prospective_chars > max_characters
+            ) and current_chunk:
+                flush()
+            current_chunk.append(sentence)
+            word_count += len(sentence_words)
+        flush()
 
-    flush_chunk(index, current)
+    flush()
+    if not chunks:
+        chunks.append(TextChunk(0, text.strip()))
     return chunks
 
 
-def chunk_text_for_manual_mode(
-    text: str, tokenizer: PreTrainedTokenizerBase, suggested_tokens: int = 600
-) -> List[TextChunk]:
-    """Generate finer-grained segments for manual oversight."""
+def estimate_total_audio_duration(word_count: int, words_per_minute: int = 150) -> float:
+    """Approximate duration (in seconds) for a given ``word_count``."""
 
-    return chunk_text(text, tokenizer, max_tokens=suggested_tokens, overlap_sentences=1)
+    minutes = word_count / max(words_per_minute, 1)
+    return minutes * 60
+
+
+def chunks_from_iterable(lines: Iterable[str], **kwargs) -> List[TextChunk]:
+    """Load text from an iterator before chunking."""
+
+    return split_text("\n".join(lines), **kwargs)

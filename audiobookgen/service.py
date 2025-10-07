@@ -1,127 +1,194 @@
-"""High level orchestration for the AudiobookGen service."""
+"""High level orchestration for the audiobook generation workflow."""
+
 from __future__ import annotations
 
-import logging
-import time
+import datetime as dt
+import json
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
 import numpy as np
+import soundfile as sf
 
-from .chunker import TextChunk, chunk_text, chunk_text_for_manual_mode
-from .text_processing import normalize_newlines, summarize_text
-from .tts_engine import GenerationConfig, KaniTTSEngine
-from .voices import DEFAULT_VOICE, available_voice_ids
+from .chunker import TextChunk, split_text
+from .config import DEFAULT_ADVANCED_PARAMS, VoiceProfile, get_voice_by_display_name
+from .tts import BaseTTSEngine, SynthesisSegment, load_engine
 
-LOGGER = logging.getLogger(__name__)
+
+@dataclass
+class SynthesisRequest:
+    text: str
+    voice: VoiceProfile
+    advanced_params: Dict[str, float]
+    session_id: Optional[str] = None
 
 
 @dataclass
 class SynthesisResult:
-    """Represents the outcome of generating one or more audio chunks."""
-
-    audio_paths: List[Path]
-    combined_path: Path
-    total_duration: float
-    segments: List[TextChunk]
+    output_path: Path
+    duration_seconds: float
+    segments: List[SynthesisSegment] = field(default_factory=list)
 
 
 @dataclass
 class ManualSession:
-    """Stateful representation of a manual mode synthesis workflow."""
-
     session_id: str
-    chunks: List[TextChunk]
-    generated_paths: Dict[int, Path] = field(default_factory=dict)
+    segments: List[TextChunk]
+    voice: VoiceProfile
+    advanced_params: Dict[str, float]
+    created_at: dt.datetime = field(default_factory=lambda: dt.datetime.utcnow())
+    generated_segments: Dict[int, Path] = field(default_factory=dict)
 
-    def remaining_chunks(self) -> Iterable[TextChunk]:
-        for chunk in self.chunks:
-            if chunk.index not in self.generated_paths:
-                yield chunk
+    def as_payload(self) -> Dict[str, str]:
+        return {
+            "session_id": self.session_id,
+            "voice": self.voice.display_name,
+            "segments": json.dumps([chunk.to_dict() for chunk in self.segments]),
+        }
 
 
-class SynthesisService:
-    """Coordinate text preparation, chunking, and waveform generation."""
+class ManualSessionManager:
+    """In-memory session store for manual workflows."""
+
+    def __init__(self) -> None:
+        self._sessions: Dict[str, ManualSession] = {}
+
+    def create(
+        self,
+        chunks: Iterable[TextChunk],
+        voice: VoiceProfile,
+        advanced_params: Dict[str, float],
+    ) -> ManualSession:
+        session_id = uuid.uuid4().hex
+        session = ManualSession(
+            session_id=session_id,
+            segments=list(chunks),
+            voice=voice,
+            advanced_params=advanced_params,
+        )
+        self._sessions[session_id] = session
+        return session
+
+    def get(self, session_id: str) -> ManualSession:
+        return self._sessions[session_id]
+
+    def list_active(self) -> List[ManualSession]:
+        return list(self._sessions.values())
+
+
+class AudiobookService:
+    """Entry point used by both the API and the HTML interface."""
 
     def __init__(
         self,
-        output_dir: Path = Path("outputs"),
-        engine: Optional[KaniTTSEngine] = None,
+        engine: Optional[BaseTTSEngine] = None,
+        output_dir: Path | str = "outputs",
     ) -> None:
-        self.output_dir = output_dir
-        self.engine = engine or KaniTTSEngine()
-        self._manual_sessions: Dict[str, ManualSession] = {}
+        self.engine = engine or load_engine()
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.sessions = ManualSessionManager()
 
-    def generate_audio(
+    # ------------------------------------------------------------------
+    # Automatic workflow
+    # ------------------------------------------------------------------
+    def synthesise_automatic(self, request: SynthesisRequest) -> SynthesisResult:
+        chunks = split_text(request.text)
+        segments: List[SynthesisSegment] = []
+        for chunk in chunks:
+            audio = self.engine.synthesise(
+                chunk.text,
+                request.voice.identifier,
+                **request.advanced_params,
+            )
+            segments.append(
+                SynthesisSegment(
+                    index=chunk.index,
+                    text=chunk.text,
+                    audio=audio,
+                    sample_rate=self.engine.sample_rate,
+                    voice_id=request.voice.identifier,
+                )
+            )
+
+        output_path = self._write_segments_to_file(segments, request.session_id)
+        duration_seconds = sum(len(seg.audio) for seg in segments) / self.engine.sample_rate
+        return SynthesisResult(output_path=output_path, duration_seconds=duration_seconds, segments=segments)
+
+    # ------------------------------------------------------------------
+    # Manual workflow
+    # ------------------------------------------------------------------
+    def create_manual_session(
         self,
         text: str,
-        speaker: str = DEFAULT_VOICE,
-        config: Optional[GenerationConfig] = None,
-        manual: bool = False,
-    ) -> SynthesisResult:
-        """Entry point for automatic or manual synthesis."""
+        voice: VoiceProfile,
+        advanced_params: Dict[str, float],
+    ) -> ManualSession:
+        chunks = split_text(text)
+        return self.sessions.create(chunks, voice, advanced_params)
 
-        sanitized = normalize_newlines(text)
-        tokenizer = self.engine.tokenizer
-        if manual:
-            chunks = chunk_text_for_manual_mode(sanitized, tokenizer)
-        else:
-            chunks = chunk_text(sanitized, tokenizer)
-
-        LOGGER.info("Prepared %s chunks for synthesis", len(chunks))
-        start_time = time.time()
-        paths: List[Path] = []
-        for chunk in chunks:
-            waveform = self.engine.synthesize(chunk.text, speaker=speaker, config=config)
-            filename = f"{int(start_time)}_{chunk.index:03d}.wav"
-            path = self.engine.save_waveform(waveform, self.output_dir / filename)
-            paths.append(path)
-            LOGGER.info("Generated chunk %s (%s tokens) -> %s", chunk.index, chunk.token_length, path)
-
-        combined_path = self._combine_paths(paths)
-        total_duration = time.time() - start_time
-        return SynthesisResult(paths, combined_path, total_duration, chunks)
-
-    def start_manual_session(self, text: str, speaker: str = DEFAULT_VOICE) -> ManualSession:
-        tokenizer = self.engine.tokenizer
-        chunks = chunk_text_for_manual_mode(normalize_newlines(text), tokenizer)
-        session_id = uuid.uuid4().hex
-        session = ManualSession(session_id=session_id, chunks=chunks)
-        self._manual_sessions[session_id] = session
-        LOGGER.info("Started manual session %s with %s chunks", session_id, len(chunks))
-        return session
-
-    def synthesize_manual_chunk(
-        self,
-        session_id: str,
-        index: int,
-        speaker: str = DEFAULT_VOICE,
-        config: Optional[GenerationConfig] = None,
+    def synthesise_manual_segment(
+        self, session_id: str, segment_index: int, voice_override: Optional[VoiceProfile] = None
     ) -> Path:
-        session = self._manual_sessions[session_id]
-        chunk = next((c for c in session.chunks if c.index == index), None)
-        if chunk is None:
-            raise ValueError(f"Chunk {index} not found in session {session_id}")
-        waveform = self.engine.synthesize(chunk.text, speaker=speaker, config=config)
-        filename = f"{session_id}_{index:03d}.wav"
-        path = self.engine.save_waveform(waveform, self.output_dir / session_id / filename)
-        session.generated_paths[index] = path
-        LOGGER.info("Manual session %s generated chunk %s -> %s", session_id, index, path)
-        return path
+        session = self.sessions.get(session_id)
+        chunk = session.segments[segment_index]
+        voice = voice_override or session.voice
+        audio = self.engine.synthesise(
+            chunk.text,
+            voice.identifier,
+            **session.advanced_params,
+        )
+        output_path = self._write_audio_chunk(audio, session_id, segment_index, voice.identifier)
+        session.generated_segments[segment_index] = output_path
+        return output_path
 
-    def _combine_paths(self, paths: Iterable[Path]) -> Path:
-        import soundfile as sf
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _write_segments_to_file(
+        self,
+        segments: Iterable[SynthesisSegment],
+        session_id: Optional[str] = None,
+    ) -> Path:
+        audio = np.concatenate([segment.audio for segment in segments])
+        file_name = self._build_output_name(session_id)
+        output_path = self.output_dir / file_name
+        sf.write(output_path, audio, self.engine.sample_rate)
+        return output_path
 
-        combined_waveform: Optional[np.ndarray] = None
-        for path in paths:
-            data, _ = sf.read(str(path))
-            combined_waveform = data if combined_waveform is None else np.concatenate([combined_waveform, data])
-        combined_path = self.output_dir / "combined.wav"
-        if combined_waveform is not None:
-            sf.write(str(combined_path), combined_waveform, self.engine.waveform_collector.sample_rate)
-        return combined_path
+    def _write_audio_chunk(
+        self,
+        audio: np.ndarray,
+        session_id: str,
+        segment_index: int,
+        voice_id: str,
+    ) -> Path:
+        file_name = f"{session_id}_segment_{segment_index:04d}_{voice_id}.wav"
+        output_path = self.output_dir / file_name
+        sf.write(output_path, audio, self.engine.sample_rate)
+        return output_path
 
-    def list_available_voices(self) -> Iterable[str]:
-        return list(available_voice_ids())
+    def _build_output_name(self, session_id: Optional[str] = None) -> str:
+        timestamp = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        if session_id:
+            return f"audiobook_{session_id}_{timestamp}.wav"
+        return f"audiobook_{timestamp}.wav"
+
+
+def create_service(engine: Optional[BaseTTSEngine] = None) -> AudiobookService:
+    return AudiobookService(engine=engine)
+
+
+def default_request_from_payload(payload: Dict[str, str]) -> SynthesisRequest:
+    text = payload.get("text", "")
+    if not text and payload.get("file_text"):
+        text = payload["file_text"]
+    voice_display = payload.get("voice")
+    voice = get_voice_by_display_name(voice_display) if voice_display else VoiceProfile("", "Default", "", "")
+    advanced = {**DEFAULT_ADVANCED_PARAMS}
+    for key in ("temperature", "top_p", "repetition_penalty", "max_new_tokens"):
+        if key in payload and payload[key]:
+            advanced[key] = float(payload[key])
+    return SynthesisRequest(text=text, voice=voice, advanced_params=advanced)
