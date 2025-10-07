@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+numpy
+soundfile
+torch
+transformers
+nemo_toolkit[tts]==2.4.0
+python-docx
